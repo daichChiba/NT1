@@ -1,4 +1,4 @@
-﻿#include <cstring>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -7,16 +7,16 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include <Novice.h>
-#ifdef USE_IMGUI
+// #ifdef USE_IMGUI
 #include <imgui.h>
-#endif
+// #endif
 
 const char kWindowTitle[] = "LE3C_12_チバ_ダイチ";
 
 // -----------------------------
 // フェーズ定義（UI 表示用）
 // -----------------------------
-enum class HttpPhase { Idle, Sending, Waiting, HeadersDone, Error, Canceled };
+enum class HttpPhase { Idle, Sending, Waiting, HeadersDone, BodyReceiving, Completed, Error, Canceled };
 
 static const char* PhaseName(HttpPhase p) {
 	switch (p) {
@@ -28,6 +28,10 @@ static const char* PhaseName(HttpPhase p) {
 		return "Waiting headers";
 	case HttpPhase::HeadersDone:
 		return "Headers done";
+	case HttpPhase::BodyReceiving:
+		return "Body receiving";
+	case HttpPhase::Completed:
+		return "Completed";
 	case HttpPhase::Error:
 		return "Error";
 	case HttpPhase::Canceled:
@@ -52,6 +56,63 @@ static std::string ConvertString(const wchar_t* wstr) {
 	return str;
 }
 
+static std::string PrettyJson(const std::string& s, int indentSize = 2) {
+	std::string out;
+	out.reserve(s.size() * 2);
+	bool inString = false, escape = false;
+	int indent = 0;
+	auto indentSpaces = [&](int n) { out.append(n * indentSize, ' '); };
+	for (char c : s) {
+		if (inString) {
+			out.push_back(c);
+			if (escape)
+				escape = false;
+			else if (c == '\\')
+				escape = true;
+			else if (c == '"')
+				inString = false;
+			continue;
+		}
+		switch (c) {
+		case ' ':
+		case '\t':
+		case '\r':
+		case '\n': // 文字列外の空白は無視
+			break;
+		case '{':
+		case '[':
+			out.push_back(c);
+			out.push_back('\n');
+			indent++;
+			indentSpaces(indent);
+			break;
+		case '}':
+		case ']':
+			out.push_back('\n');
+			indent--;
+			indentSpaces(indent);
+			out.push_back(c);
+			break;
+		case ',':
+			out.push_back(c);
+			out.push_back('\n');
+			indentSpaces(indent);
+			break;
+		case ':':
+			out.push_back(':');
+			out.push_back(' ');
+			break;
+		case '"':
+			inString = true;
+			out.push_back(c);
+			break;
+		default:
+			out.push_back(c);
+		}
+	}
+	return out;
+}
+
 // -----------------------------
 // HTTP 非同期状態
 // -----------------------------
@@ -66,22 +127,32 @@ struct HttpAsyncState {
 
 	bool active = false; // リクエスト進行中か
 	HttpPhase phase = HttpPhase::Idle;
+
+	// 受信本文バッファ（UTF-8想定の生バイト）
+	std::string responseBody;
+	size_t totalRead = 0;
+
+	// 現在の WinHttpReadData で使っている読み取りバッファ
+	// DATA_AVAILABLE で resize() して、READ_COMPLETE で append します
+	std::vector<char> inflightBuffer;
 };
 
 // ハンドル掃除
 static void CloseAll(HttpAsyncState& state) {
+	// inflightBuffer もクリアしておくことで、中断時に未解放メモリが残らないようにします
+	state.inflightBuffer.clear();
+
 	if (state.request) {
-		// WinHTTPのハンドルはWinHttpCloseHandleで都度破棄しないとカーネルリソースがリークする
+		// WinHTTPのハンドルはWinHttpCloseHandleで都度破棄しないとカーネルリソースがリークします
 		WinHttpCloseHandle(state.request);
 		state.request = nullptr;
 	}
 	if (state.connect) {
-		// 接続ハンドルも同様に必ず閉じる
 		WinHttpCloseHandle(state.connect);
 		state.connect = nullptr;
 	}
 	if (state.session) {
-		// セッションを閉じると、その配下の接続ハンドルもまとめて無効化される
+		// セッションを閉じると、その配下の接続ハンドルもまとめて無効化されます
 		WinHttpCloseHandle(state.session);
 		state.session = nullptr;
 	}
@@ -93,12 +164,15 @@ static void ResetFlags(HttpAsyncState& state) {
 	state.error = false;
 	state.errorCode = 0;
 	state.phase = HttpPhase::Idle;
+	state.responseBody.clear();
+	state.totalRead = 0;
+	state.inflightBuffer.clear();
 }
 
 // -----------------------------
 // WinHTTP コールバック
 // -----------------------------
-static void CALLBACK HttpCallback(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID info, DWORD) {
+static void CALLBACK HttpCallback(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID info, DWORD infoLen) {
 	auto* state = reinterpret_cast<HttpAsyncState*>(ctx);
 	if (!state) {
 		return;
@@ -106,30 +180,96 @@ static void CALLBACK HttpCallback(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID
 
 	switch (status) {
 	case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: {
-		// WinHttpSendRequest が送信を完了した瞬間に通知される
-		// 非同期モードなのでここで明示的に WinHttpReceiveResponse を呼び出しレスポンス受信を開始する
+		// 送信完了 → レスポンス受信開始
 		state->phase = HttpPhase::Waiting;
 		WinHttpReceiveResponse(state->request, nullptr);
 	} break;
 
 	case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
-		// レスポンスヘッダが到着したタイミングで呼ばれる
+		// ヘッダー到着
 		DWORD code = 0, size = sizeof(code);
 		if (WinHttpQueryHeaders(state->request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX)) {
-			// 数値形式でステータスコードを取得して記録する
 			state->statusCode = code;
 			state->phase = HttpPhase::HeadersDone;
+		}
+
+		// 本文読み取りを開始
+		state->phase = HttpPhase::BodyReceiving;
+		WinHttpQueryDataAvailable(state->request, nullptr);
+	} break;
+
+	case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE: {
+		// 読み取り可能なサイズ（バイト数）
+		DWORD bytesAvailable = 0;
+		if (info && infoLen == sizeof(DWORD)) {
+			bytesAvailable = *reinterpret_cast<DWORD*>(info);
+		}
+
+		if (bytesAvailable == 0) {
+			// 本文の終端
+			state->phase = HttpPhase::Completed;
+
+			// 読み取り完了後にクローズ（UI表示のため responseBody は保持）
+			CloseAll(*state);
+		} else {
+			// inflightBuffer を必要サイズに確保
+			state->inflightBuffer.resize(bytesAvailable);
+
+			// 非同期読み取りを要求
+			if (!WinHttpReadData(state->request, state->inflightBuffer.data(), bytesAvailable, nullptr)) {
+				// 読み取り開始に失敗
+				state->error = true;
+				state->errorCode = GetLastError();
+				state->phase = HttpPhase::Error;
+
+				state->inflightBuffer.clear();
+				CloseAll(*state);
+			}
+		}
+	} break;
+
+	case WINHTTP_CALLBACK_STATUS_READ_COMPLETE: {
+		// WinHttpReadData() の第二引数に渡したアドレスが info として戻ってくる契約
+		// infoLen は実際に読み取れたバイト数。0なら終端。
+		if (info) {
+			if (infoLen > 0) {
+				// inflightBuffer の先頭から infoLen バイト分を body に追記
+				state->responseBody.append(state->inflightBuffer.data(), state->inflightBuffer.data() + infoLen);
+				state->totalRead += infoLen;
+
+				// 今回ぶんは処理済みなのでクリア
+				state->inflightBuffer.clear();
+
+				// 続きを問い合わせ
+				WinHttpQueryDataAvailable(state->request, nullptr);
+			} else {
+				// 0バイト → もう終わり
+				state->phase = HttpPhase::Completed;
+				state->inflightBuffer.clear();
+				CloseAll(*state);
+			}
+		} else {
+			// info==nullptr は異常ケースとして扱います
+			state->error = true;
+			state->phase = HttpPhase::Error;
+			state->errorCode = ERROR_INVALID_DATA;
+
+			state->inflightBuffer.clear();
+			CloseAll(*state);
 		}
 	} break;
 
 	case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
-		// 非同期API内部でエラーが発生した際の通知。dwErrorにWinHTTP/Win32のエラーコードが入る
+		// 非同期API内部でエラーが発生
 		state->error = true;
-		if (info) {
+		if (info && infoLen == sizeof(WINHTTP_ASYNC_RESULT)) {
 			auto* asyncResult = reinterpret_cast<WINHTTP_ASYNC_RESULT*>(info);
 			state->errorCode = asyncResult->dwError;
 		}
 		state->phase = HttpPhase::Error;
+
+		state->inflightBuffer.clear();
+		CloseAll(*state);
 	} break;
 
 	default:
@@ -140,13 +280,21 @@ static void CALLBACK HttpCallback(HINTERNET, DWORD_PTR ctx, DWORD status, LPVOID
 // -----------------------------
 // 送信開始 / キャンセル
 // -----------------------------
-static bool StartHttpRequest(HttpAsyncState& state, const wchar_t* host, const wchar_t* path, const wchar_t* headers, const char* body) {
+static bool StartHttpRequest(
+    HttpAsyncState& state,
+    const wchar_t* method,  // L"GET" / L"POST" ...
+    const wchar_t* host,    // 例: L"jsonplaceholder.typicode.com"
+    const wchar_t* path,    // 例: L"/todos/1"
+    const wchar_t* headers, // 例: L"Accept: application/json\r\nUser-Agent: ...\r\n"
+    const char* body,       // GETならnullptr
+    DWORD bodyLength        // GETなら0
+) {
 	if (state.active) {
 		return false;
 	}
 	ResetFlags(state);
 
-	// WinHttpOpenでHTTPセッション(=ユーザーエージェント)を作成する。非同期なのでWINHTTP_FLAG_ASYNCを付与
+	// 非同期セッション
 	state.session = WinHttpOpen(L"realtime-rest-check/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
 	if (!state.session) {
 		state.error = true;
@@ -155,7 +303,7 @@ static bool StartHttpRequest(HttpAsyncState& state, const wchar_t* host, const w
 		return false;
 	}
 
-	// セッションから対象ホストへの接続ハンドルを生成。HTTPSなので443番ポートを指定
+	// HTTPS 443 で接続
 	state.connect = WinHttpConnect(state.session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
 	if (!state.connect) {
 		state.error = true;
@@ -165,8 +313,8 @@ static bool StartHttpRequest(HttpAsyncState& state, const wchar_t* host, const w
 		return false;
 	}
 
-	// 実際のHTTPリクエストハンドルを作成。WINHTTP_FLAG_SECUREでTLSを有効化する
-	state.request = WinHttpOpenRequest(state.connect, L"POST", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+	// メソッド指定
+	state.request = WinHttpOpenRequest(state.connect, method, path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
 	if (!state.request) {
 		state.error = true;
 		state.errorCode = GetLastError();
@@ -175,21 +323,22 @@ static bool StartHttpRequest(HttpAsyncState& state, const wchar_t* host, const w
 		return false;
 	}
 
-	const DWORD kCallbackFlags = WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE | WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR;
-	// 受け取りたいイベントをビット列で指定し、コールバック関数を登録する
+	// 受け取りたいイベント
+	const DWORD kCallbackFlags = WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE | WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE | WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE | WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
+	                             WINHTTP_CALLBACK_FLAG_REQUEST_ERROR;
+
 	WinHttpSetStatusCallback(state.request, &HttpCallback, kCallbackFlags, 0);
 
+	// コールバックから HttpAsyncState* にアクセスできるようにする
 	DWORD_PTR context = reinterpret_cast<DWORD_PTR>(&state);
-	// コールバックから状態へ戻るためのユーザーデータとしてHttpAsyncStateのポインタを紐づける
 	WinHttpSetOption(state.request, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context));
-
-	DWORD bodyLength = static_cast<DWORD>(std::strlen(body));
 
 	state.phase = HttpPhase::Sending;
 	state.active = true;
 
+	// 送信（GETなら body=nullptr/len=0）
 	BOOL ok = WinHttpSendRequest(state.request, headers, static_cast<DWORD>(-1), (LPVOID)body, bodyLength, bodyLength, 0);
-	// WinHttpSendRequestは非同期フラグが立っているとすぐに戻る。完了後はコールバックで通知される
+
 	if (!ok) {
 		state.error = true;
 		state.errorCode = GetLastError();
@@ -200,16 +349,16 @@ static bool StartHttpRequest(HttpAsyncState& state, const wchar_t* host, const w
 	return true;
 }
 
-static void CancelHttp(HttpAsyncState& s) {
-	s.phase = HttpPhase::Canceled;
-	CloseAll(s);
+static void CancelHttp(HttpAsyncState& state) {
+	state.phase = HttpPhase::Canceled;
+	state.inflightBuffer.clear();
+	CloseAll(state);
 }
 
 // -----------------------------
 // アプリ本体
 // -----------------------------
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-
 	// ライブラリの初期化
 	const int kWindowWidth = 1280;
 	const int kWindowHeight = 720;
@@ -219,47 +368,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	char keys[256] = {0};
 	char preKeys[256] = {0};
 
-	// 接続先情報
-	const wchar_t* kHostName = L"oolchvtzizhmniggcaiw.supabase.co";
-	const wchar_t* kConnectionPath = L"/realtime/v1/api/broadcast";
+	// --- ISSの位置情報 ---
+	const wchar_t* kHostName = L"api.wheretheiss.at";
+	const wchar_t* kPath = L"v1/satellites/25544";
 
-	// ヘッダ（\r\n 必須）
-	const wchar_t* kHttpHeaders = L"Content-Type: application/json\r\n"
-	                              L"apikey: sb_publishable_kcL7fFe5hC-ruqdcW0Yjdg_lsRXWu3J\r\n";
+	// ヘッダ（\r\n 必須）。User-Agent は一部のAPIで必須です。
+	// Acceptには application/json
+	// を指定してJSONレスポンスを要求します。そのとおりに応えてくれるかはサーバー次第。
+	const wchar_t* kHttpHeaders = L"Accept: application/json\r\n"
+	                              L"User-Agent: NoviceWinHTTP/1.0\r\n";
 
-	// JSON 本文（生文字列）
-	const char* kBody = R"JSON({
-	  "messages": [
-		{
-		  "topic": "test",
-		  "event": "msg",
-		  "payload": { "text": "hi" }
-		}
-	  ]
-	})JSON";
-
-	// HTTP 非同期状態
 	HttpAsyncState asyncState;
 
-	// ウィンドウの×ボタンが押されるまでループ
 	while (Novice::ProcessMessage() == 0) {
 		Novice::BeginFrame();
 
 		std::memcpy(preKeys, keys, 256);
 		Novice::GetHitKeyStateAll(keys);
 
-		// Window表示
-		ImGui::SetNextWindowSize(ImVec2(560, 320), ImGuiCond_Once);
+		// #ifdef USE_IMGUI
+		//  Window表示
+		ImGui::SetNextWindowSize(ImVec2(720, 520), ImGuiCond_Once);
 		ImGui::Begin("HTTP Async Control & Monitor", nullptr, ImGuiWindowFlags_NoCollapse);
 
 		// 行1: 操作ボタンとフェーズ表示
 		{
 			bool canConnect = !asyncState.active &&
-			                  (asyncState.phase == HttpPhase::Idle || asyncState.phase == HttpPhase::HeadersDone || asyncState.phase == HttpPhase::Error || asyncState.phase == HttpPhase::Canceled);
+			                  (asyncState.phase == HttpPhase::Idle || asyncState.phase == HttpPhase::Completed || asyncState.phase == HttpPhase::Error || asyncState.phase == HttpPhase::Canceled);
 
 			if (canConnect) {
 				if (ImGui::Button("Connect")) {
-					StartHttpRequest(asyncState, kHostName, kConnectionPath, kHttpHeaders, kBody);
+					StartHttpRequest(asyncState, L"GET", kHostName, kPath, kHttpHeaders, nullptr, 0);
 				}
 				ImGui::SameLine();
 				if (ImGui::Button("Reset")) {
@@ -281,7 +420,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		// 行2: 接続先情報
 		{
 			std::string host8 = ConvertString(kHostName);
-			std::string path8 = ConvertString(kConnectionPath);
+			std::string path8 = ConvertString(kPath);
 			ImGui::Text("Host: %s", host8.c_str());
 			ImGui::SameLine();
 			ImGui::Text("|");
@@ -296,26 +435,47 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Status: ERROR");
 			ImGui::BulletText("dwError = %lu", asyncState.errorCode);
 			ImGui::TextDisabled("request=%p  connect=%p  session=%p", asyncState.request, asyncState.connect, asyncState.session);
+
 		} else if (asyncState.phase == HttpPhase::HeadersDone) {
-			ImVec4 col = (asyncState.statusCode >= 200 && asyncState.statusCode < 300) ? ImVec4(0.3f, 1.0f, 0.5f, 1.0f) : ImVec4(1.0f, 0.7f, 0.2f, 1.0f);
-			ImGui::TextColored(col, "HTTP %lu", asyncState.statusCode);
+			ImGui::Text("HTTP %lu", asyncState.statusCode);
 			ImGui::BulletText("Headers received.");
+
+		} else if (asyncState.phase == HttpPhase::BodyReceiving) {
+			ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f), "Receiving body...");
+			ImGui::BulletText("Read: %zu bytes", asyncState.totalRead);
+			ImGui::TextDisabled("request=%p connect=%p session=%p", asyncState.request, asyncState.connect, asyncState.session);
+
+		} else if (asyncState.phase == HttpPhase::Completed) {
+			ImVec4 col = (asyncState.statusCode >= 200 && asyncState.statusCode < 300) ? ImVec4(0.3f, 1.0f, 0.5f, 1.0f) : ImVec4(1.0f, 0.7f, 0.2f, 1.0f);
+
+			ImGui::TextColored(col, "HTTP %lu (Completed, %zu bytes)", asyncState.statusCode, asyncState.totalRead);
+
+			ImGui::Separator();
+			// ImGuiWindowFlags childFlags = ImGuiWindowFlags_None;
+			//  0.0f で「現在のウィンドウ幅に合わせて折り返し」
+			ImGui::PushTextWrapPos(0.0f);
+			// json整形
+			std::string pretty = PrettyJson(asyncState.responseBody);
+			// 内容の表示
+			ImGui::InputTextMultiline("##json", pretty.data(), pretty.size(), ImVec2(0, 260), ImGuiInputTextFlags_ReadOnly);
+			ImGui::PopTextWrapPos();
+
 		} else if (asyncState.phase == HttpPhase::Sending || asyncState.phase == HttpPhase::Waiting) {
+
 			ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f), "Waiting response...");
 			ImGui::BulletText(asyncState.phase == HttpPhase::Sending ? "Sending request..." : "Awaiting headers...");
 			ImGui::TextDisabled("request=%p connect=%p session=%p", asyncState.request, asyncState.connect, asyncState.session);
+
 		} else if (asyncState.phase == HttpPhase::Canceled) {
 			ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Canceled");
-		} else { // Idle
+
+		} else {
+			// Idle
 			ImGui::TextDisabled("Idle. Press Connect to start.");
 		}
 
 		ImGui::End();
-
-		// ヘッダー受信後は自動でハンドル解放（次回Connectをすぐ可能にする）
-		if (asyncState.phase == HttpPhase::HeadersDone && asyncState.active) {
-			CloseAll(asyncState);
-		}
+		// #endif // USE_IMGUI
 
 		Novice::EndFrame();
 
