@@ -90,7 +90,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\KamataEngine\External\KamataEngine\lib\$(Configuration);C:\KamataEngine\External\DirectXTex\lib\$(Configuration);.\ixwebsocket\lib\$(Configuration);$(SolutionDir)ixwebsocket\lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\KamataEngine\External\KamataEngine\lib\$(Configuration);C:\KamataEngine\External\DirectXTex\lib\$(Configuration);.\ixwebsocket\lib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>KamataEngine.lib;DirectXTex.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
