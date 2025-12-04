@@ -14,6 +14,10 @@
 
 #include "nlohmann/json.hpp"
 
+#include <unordered_set>
+#define UUID_SYSTEM_GENERATOR
+#include "uuid/uuid.h"
+
 #include <Novice.h>
 #ifdef USE_IMGUI
 #include <imgui.h>
@@ -119,11 +123,13 @@ std::string MakePresenceTrackMessage(const std::string& topic, const std::string
 }
 
 // チャットメッセージ生成（Broadcast）
-std::string MakeChatMessage(const std::string& topic, const std::string& userName, const std::string& message) {
+std::string MakeChatMessage(const std::string& topic, const std::string& userName, const std::string& message, const std::string& messageId) {
 	json jsonObject;
 	jsonObject["topic"] = topic;
 	jsonObject["event"] = "broadcast"; // 全員に配信するイベント
 	jsonObject["ref"] = "chat_1";
+
+	jsonObject["payload"]["payload"]["message_id"] = messageId;
 
 	// Broadcast用のPayload構造
 	jsonObject["payload"]["type"] = "broadcast";
@@ -229,16 +235,22 @@ struct ChatEntry {
 	std::string userName;
 	std::string message;
 	std::string timeStr;
+	std::string massageId;
 };
 
 class ChatManager {
 public:
-	void AddMessage(const std::string& userName, const std::string& message) {
+	void AddMessage(const std::string& userName, const std::string& message, const std::string& messageId) {
+		if (seenMessageIds_.find(messageId)!=seenMessageIds_.end()) {
+			return;// 重複なので何もしない
+		}
 		std::lock_guard<std::mutex> lock(mutex_);
 		ChatEntry entry;
 		entry.userName = userName;
 		entry.message = message;
 		entry.timeStr = Utils::GetCurrentTimeLocal();
+		// 登録するChatEntryのmessageIdに代入するのを忘れずに
+		entry.massageId = messageId;
 		messages_.push_back(entry);
 
 		// 履歴上限（例：50件）
@@ -260,6 +272,7 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::vector<ChatEntry> messages_;
+	std::unordered_set<std::string> seenMessageIds_; // 重複排除用
 };
 
 // Realtime 接続状態クラス
@@ -426,6 +439,7 @@ bool ParseChatMessage(const std::string& jsonString, ChatEntry& outEntry) {
 				if (data.contains("user_name") && data.contains("message")) {
 					outEntry.userName = data["user_name"].get<std::string>();
 					outEntry.message = data["message"].get<std::string>();
+					outEntry.massageId = data["message_id"].get<std::string>();
 					return true;
 				}
 			}
@@ -545,6 +559,7 @@ bool DrawChatWindow(const ChatManager& chatManager, char* inputBuf) {
 	auto messages = chatManager.GetMessages();
 
 	for (const auto& msg : messages) {
+		ImGui::TextWrapped("msgId:%s", msg.massageId.c_str());
 		ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "[%s] %s:", msg.timeStr.c_str(), msg.userName.c_str());
 		ImGui::SameLine();
 		ImGui::TextWrapped("%s", msg.message.c_str());
@@ -679,7 +694,7 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 					ChatEntry chatEntry;
 					bool parsed = PresenceParser::ParseChatMessage(receivedText, chatEntry);
 					if (parsed) {
-						chatManager.AddMessage(chatEntry.userName, chatEntry.message);
+						chatManager.AddMessage(chatEntry.userName, chatEntry.message,chatEntry.massageId);
 					}
 				}
 
@@ -739,10 +754,12 @@ int32_t WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int32_t) {
 			bool sendTriggered = UI::DrawChatWindow(chatManager, chatInputBuf);
 
 			if (sendTriggered) {
+				auto uuid = uuids::uuid_system_generator{}();
+				auto messageId = uuids::to_string(uuid);
 				// ★★★スライド8枚目の処理をここに追加
-				std::string msgPayload = MessageFactory::MakeChatMessage(Config::kTopic, displayUserName, chatInputBuf);
+				std::string msgPayload = MessageFactory::MakeChatMessage(Config::kTopic, displayUserName, chatInputBuf,messageId);
 				webSocketPtr->sendText(msgPayload);
-				chatManager.AddMessage(displayUserName, chatInputBuf);
+				chatManager.AddMessage(displayUserName, chatInputBuf,messageId);
 
 				// 入力欄クリアとフォーカス維持
 				chatInputBuf[0] = '\0';
