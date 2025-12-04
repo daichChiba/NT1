@@ -436,7 +436,7 @@ bool ParseChatMessage(const std::string& jsonString, ChatEntry& outEntry) {
 			json payload = parsedJson["payload"];
 			if (payload.value("event", "") == "chat_message" && payload.contains("payload")) {
 				json data = payload["payload"];
-				if (data.contains("user_name") && data.contains("message") && data.contains("massage_id")) {
+				if (data.contains("user_name") && data.contains("message")) {
 					outEntry.userName = data["user_name"].get<std::string>();
 					outEntry.message = data["message"].get<std::string>();
 					outEntry.massageId = data["message_id"].get<std::string>();
